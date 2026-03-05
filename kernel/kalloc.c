@@ -80,3 +80,20 @@ kalloc(void)
     memset((char*)r, 5, PGSIZE); // fill with junk
   return (void*)r;
 }
+
+
+// Get the amount of free memory in the system (in bytes).
+// Used by sysinfo system call.
+int
+kfreememamount(void)
+{
+  struct run *r;
+  int free_pages = 0;
+
+  acquire(&kmem.lock);
+  for(r = kmem.freelist; r; r = r->next)
+    free_pages++;
+  release(&kmem.lock);
+
+  return free_pages * PGSIZE;
+}
