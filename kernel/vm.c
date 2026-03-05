@@ -447,14 +447,12 @@ vmprint_rec(pagetable_t pagetable, int level)
       for (int j = 0; j < level; j++) {
         printf(" ..");
       }
-      if ((pte & (PTE_R|PTE_W|PTE_X)) == 0) {
-      // this PTE points to a lower-level page table.
-      uint64 child = PTE2PA(pte);
-      printf("%d: pte %p pa %p\n", i, pte, child);
-      vmprint_rec((pagetable_t)child, level+1);
-      } else {
-        printf("%d: pte %p\n", i, pte);
-      }
+
+      uint64 pa = PTE2PA(pte);
+      printf("%d: pte %p pa %p\n", i, pte, pa);
+      
+      if ((pte & (PTE_R | PTE_W | PTE_X)) == 0)
+        vmprint_rec((pagetable_t)pa, level + 1);
     }
   }
 }
