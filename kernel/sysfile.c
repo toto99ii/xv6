@@ -503,3 +503,31 @@ sys_pipe(void)
   }
   return 0;
 }
+
+uint64
+sys_mmap(void)
+{
+  uint64 addr, offset;
+  int length, prot, flags, fd;
+  struct file *f;
+
+  argaddr(0, &addr);
+  argint(1, &length);
+  argint(2, &prot);
+  argint(3, &flags);
+  if(argfd(4, &fd, &f) < 0) return -1;
+  argaddr(5, &offset);
+
+  return proc_mmap(myproc(), f, length, prot, flags, offset);
+}
+
+uint64
+sys_munmap(void)
+{
+  uint64 addr;
+  int length;
+
+  argaddr(0, &addr);
+  argint(1, &length);
+  return proc_munmap(myproc(), addr, length);
+}

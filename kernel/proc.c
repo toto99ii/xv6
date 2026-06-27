@@ -5,6 +5,10 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "fcntl.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
 
 struct cpu cpus[NCPU];
 
@@ -55,6 +59,8 @@ procinit(void)
       initlock(&p->lock, "proc");
       p->state = UNUSED;
       p->kstack = KSTACK((int) (p - proc));
+      p->mmap_base = TRAPFRAME;
+      memset(p->vmas, 0, sizeof(p->vmas));
   }
 }
 
@@ -124,6 +130,8 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  p->mmap_base = TRAPFRAME;
+  memset(p->vmas, 0, sizeof(p->vmas));
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -159,9 +167,11 @@ freeproc(struct proc *p)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
   if(p->pagetable)
-    proc_freepagetable(p->pagetable, p->sz);
+    proc_freepagetable(p, p->pagetable, p->sz);
   p->pagetable = 0;
   p->sz = 0;
+  p->mmap_base = TRAPFRAME;
+  memset(p->vmas, 0, sizeof(p->vmas));
   p->pid = 0;
   p->parent = 0;
   p->name[0] = 0;
@@ -169,6 +179,267 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+}
+
+static void
+mmap_clear_vma(struct vma *v)
+{
+  memset(v, 0, sizeof(*v));
+}
+
+static int
+mmap_writeback(struct vma *v, pagetable_t pagetable, uint64 addr, uint64 len)
+{
+  uint64 end = addr + len;
+
+  if((v->flags & MAP_SHARED) == 0)
+    return 0;
+
+  for(uint64 a = addr; a < end; a += PGSIZE){
+    pte_t *pte = walk(pagetable, a, 0);
+    uint64 fileoff, n, pa;
+
+    if(pte == 0 || (*pte & PTE_V) == 0)
+      continue;
+
+    fileoff = v->off + (a - v->addr);
+    if(fileoff >= v->filelen)
+      continue;
+    n = PGSIZE;
+    if(fileoff + n > v->filelen)
+      n = v->filelen - fileoff;
+
+    pa = PTE2PA(*pte);
+    begin_op();
+    ilock(v->file->ip);
+    if(writei(v->file->ip, 0, pa, fileoff, n) < 0){
+      iunlock(v->file->ip);
+      end_op();
+      return -1;
+    }
+    iunlock(v->file->ip);
+    end_op();
+  }
+
+  return 0;
+}
+
+void
+proc_mmapcleanup(struct proc *p)
+{
+  for(int i = 0; i < NELEM(p->vmas); i++){
+    struct vma *v = &p->vmas[i];
+
+    if(v->valid == 0 || v->file == 0)
+      continue;
+    mmap_writeback(v, p->pagetable, v->addr, v->len);
+    fileclose(v->file);
+    v->file = 0;
+  }
+}
+
+uint64
+proc_mmap(struct proc *p, struct file *f, uint64 length, int prot, int flags, uint64 offset)
+{
+  struct vma *v = 0;
+  uint64 addr, size, filelen;
+  int perm = PTE_U;
+  int slot = -1;
+  int mapped = 0;
+
+  if(offset != 0 || length == 0)
+    return -1;
+  if(flags != MAP_SHARED && flags != MAP_PRIVATE)
+    return -1;
+  if((prot & (PROT_READ | PROT_WRITE | PROT_EXEC)) == 0)
+    return -1;
+  if((prot & PROT_READ) && !f->readable)
+    return -1;
+  if((prot & PROT_WRITE) && flags == MAP_SHARED && !f->writable)
+    return -1;
+  if(f->type != FD_INODE || f->ip == 0)
+    return -1;
+
+  for(int i = 0; i < NELEM(p->vmas); i++){
+    if(p->vmas[i].valid == 0){
+      slot = i;
+      break;
+    }
+  }
+  if(slot < 0)
+    return -1;
+
+  size = PGROUNDUP(length);
+  addr = PGROUNDDOWN(p->mmap_base - size);
+  if(addr < PGROUNDUP(p->sz))
+    return -1;
+
+  filedup(f);
+  ilock(f->ip);
+  filelen = f->ip->size;
+  iunlock(f->ip);
+
+  if(prot & PROT_READ)
+    perm |= PTE_R;
+  if(prot & PROT_WRITE)
+    perm |= PTE_W;
+  if(prot & PROT_EXEC)
+    perm |= PTE_X;
+
+  v = &p->vmas[slot];
+  v->valid = 1;
+  v->addr = addr;
+  v->len = size;
+  v->off = offset;
+  v->filelen = filelen;
+  v->prot = prot;
+  v->flags = flags;
+  v->file = f;
+
+  for(uint64 a = 0; a < size; a += PGSIZE){
+    char *mem = kalloc();
+    if(mem == 0)
+      goto bad;
+    memset(mem, 0, PGSIZE);
+
+    ilock(f->ip);
+    if(readi(f->ip, 0, (uint64)mem, offset + a, PGSIZE) < 0){
+      iunlock(f->ip);
+      kfree(mem);
+      goto bad;
+    }
+    iunlock(f->ip);
+
+    if(mappages(p->pagetable, addr + a, PGSIZE, (uint64)mem, perm) < 0){
+      kfree(mem);
+      goto bad;
+    }
+    mapped += 1;
+  }
+
+  p->mmap_base = addr;
+  return addr;
+
+bad:
+  if(mapped > 0)
+    uvmunmap(p->pagetable, addr, mapped, 1);
+  if(v != 0){
+    fileclose(v->file);
+    mmap_clear_vma(v);
+  } else {
+    fileclose(f);
+  }
+  return -1;
+}
+
+int
+proc_munmap(struct proc *p, uint64 addr, uint64 length)
+{
+  uint64 len = PGROUNDUP(length);
+
+  if(addr % PGSIZE != 0 || len == 0)
+    return -1;
+
+  for(int i = 0; i < NELEM(p->vmas); i++){
+    struct vma *v = &p->vmas[i];
+    uint64 end;
+
+    if(v->valid == 0)
+      continue;
+
+    end = v->addr + v->len;
+    if(addr == v->addr && len <= v->len){
+      if(mmap_writeback(v, p->pagetable, addr, len) < 0)
+        return -1;
+      uvmunmap(p->pagetable, addr, len / PGSIZE, 1);
+      if(len == v->len){
+        fileclose(v->file);
+        mmap_clear_vma(v);
+      } else {
+        v->addr += len;
+        v->off += len;
+        v->len -= len;
+      }
+      return 0;
+    }
+
+    if(addr + len == end && len <= v->len){
+      if(mmap_writeback(v, p->pagetable, addr, len) < 0)
+        return -1;
+      uvmunmap(p->pagetable, addr, len / PGSIZE, 1);
+      v->len -= len;
+      if(v->len == 0){
+        fileclose(v->file);
+        mmap_clear_vma(v);
+      }
+      return 0;
+    }
+
+    if(addr == v->addr && len == v->len){
+      if(mmap_writeback(v, p->pagetable, addr, len) < 0)
+        return -1;
+      uvmunmap(p->pagetable, addr, len / PGSIZE, 1);
+      fileclose(v->file);
+      mmap_clear_vma(v);
+      return 0;
+    }
+  }
+
+  return -1;
+}
+
+int
+proc_mmapfork(struct proc *p, struct proc *np)
+{
+  np->mmap_base = p->mmap_base;
+  memset(np->vmas, 0, sizeof(np->vmas));
+
+  for(int i = 0; i < NELEM(p->vmas); i++){
+    struct vma *src = &p->vmas[i];
+    struct vma *dst;
+    int perm = PTE_U;
+
+    if(src->valid == 0)
+      continue;
+
+    dst = 0;
+    for(int j = 0; j < NELEM(np->vmas); j++){
+      if(np->vmas[j].valid == 0){
+        dst = &np->vmas[j];
+        break;
+      }
+    }
+    if(dst == 0)
+      return -1;
+
+    *dst = *src;
+    dst->file = filedup(src->file);
+
+    if(src->prot & PROT_READ)
+      perm |= PTE_R;
+    if(src->prot & PROT_WRITE)
+      perm |= PTE_W;
+    if(src->prot & PROT_EXEC)
+      perm |= PTE_X;
+
+    for(uint64 a = 0; a < src->len; a += PGSIZE){
+      char *mem = kalloc();
+      uint64 pa = walkaddr(p->pagetable, src->addr + a);
+
+      if(mem == 0 || pa == 0){
+        if(mem)
+          kfree(mem);
+        return -1;
+      }
+      memmove(mem, (void *)pa, PGSIZE);
+      if(mappages(np->pagetable, src->addr + a, PGSIZE, (uint64)mem, perm) < 0){
+        kfree(mem);
+        return -1;
+      }
+    }
+  }
+
+  return 0;
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -208,8 +479,17 @@ proc_pagetable(struct proc *p)
 // Free a process's page table, and free the
 // physical memory it refers to.
 void
-proc_freepagetable(pagetable_t pagetable, uint64 sz)
+proc_freepagetable(struct proc *p, pagetable_t pagetable, uint64 sz)
 {
+  for(int i = 0; i < NELEM(p->vmas); i++){
+    struct vma *v = &p->vmas[i];
+
+    if(v->valid == 0)
+      continue;
+    uvmunmap(pagetable, v->addr, v->len / PGSIZE, 1);
+    mmap_clear_vma(v);
+  }
+
   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
   uvmunmap(pagetable, TRAPFRAME, 1, 0);
   uvmfree(pagetable, sz);
@@ -296,6 +576,13 @@ fork(void)
   }
   np->sz = p->sz;
 
+  if(proc_mmapfork(p, np) < 0){
+    release(&np->lock);
+    proc_mmapcleanup(np);
+    freeproc(np);
+    return -1;
+  }
+
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
 
@@ -364,6 +651,8 @@ exit(int status)
   iput(p->cwd);
   end_op();
   p->cwd = 0;
+
+  proc_mmapcleanup(p);
 
   acquire(&wait_lock);
 

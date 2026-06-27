@@ -1,3 +1,6 @@
+struct file;
+struct inode;
+
 // Saved registers for kernel context switches.
 struct context {
   uint64 ra;
@@ -79,6 +82,17 @@ struct trapframe {
   /* 280 */ uint64 t6;
 };
 
+struct vma {
+  int valid;            // 1 if this vma is valid, 0 if not.
+  uint64 addr;          // starting virtual address of the mapping
+  uint64 len;           // length of the mapping in bytes
+  uint64 off;           // offset in the file where the mapping starts
+  uint64 filelen;       // length of the file in bytes
+  int prot;             // protection flags (PROT_READ, PROT_WRITE, PROT_EXEC)
+  int flags;            // mapping flags (MAP_SHARED, MAP_PRIVATE)
+  struct file *file;    // pointer to the file being mapped
+};
+
 enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 
 // Per-process state
@@ -98,10 +112,12 @@ struct proc {
   // these are private to the process, so p->lock need not be held.
   uint64 kstack;               // Virtual address of kernel stack
   uint64 sz;                   // Size of process memory (bytes)
+  uint64 mmap_base;            // Base of available mmap space.
   pagetable_t pagetable;       // User page table
   struct trapframe *trapframe; // data page for trampoline.S
   struct context context;      // swtch() here to run process
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
+  struct vma vmas[NVMA];       // Memory mappings.
   char name[16];               // Process name (debugging)
 };
